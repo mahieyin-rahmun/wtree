@@ -1,0 +1,77 @@
+name: shared-dev
+services:
+  dev_postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports: ["127.0.0.1:5442:5432"]
+    volumes: ["dev_postgres_data:/var/lib/postgresql/data"]
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  test_postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports: ["127.0.0.1:5443:5432"]
+    volumes: ["test_postgres_data:/var/lib/postgresql/data"]
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "password", "--maxmemory-policy", "noeviction"]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "password", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  localstack:
+    image: localstack/localstack:4.9.2
+    environment:
+      SERVICES: s3
+      AWS_DEFAULT_REGION: us-east-1
+      PERSISTENCE: "1"
+    ports: ["127.0.0.1:4566:4566"]
+    volumes: ["localstack_data:/var/lib/localstack"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:4566/_localstack/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+  mailpit:
+    image: axllent/mailpit:v1.29.7
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: "5000"
+    ports: ["127.0.0.1:1025:1025", "127.0.0.1:8025:8025"]
+    volumes: ["mailpit_data:/data"]
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    profiles: ["azure"]
+    command: ["azurite", "--blobHost", "0.0.0.0", "--queueHost", "0.0.0.0", "--tableHost", "0.0.0.0", "--skipApiVersionCheck", "--disableProductStyleUrl"]
+    ports: ["127.0.0.1:10000:10000", "127.0.0.1:10001:10001", "127.0.0.1:10002:10002"]
+    volumes: ["azurite_data:/data"]
+volumes:
+  dev_postgres_data:
+  test_postgres_data:
+  redis_data:
+  localstack_data:
+  mailpit_data:
+  azurite_data:

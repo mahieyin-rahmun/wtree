@@ -1,0 +1,18 @@
+{
+  "project": "my-app",
+  "prefix": "myapp",
+  "databases": {
+    "DATABASE_URL": "app"
+  },
+  "bucket": "my-app-dev-bucket",
+  "migrate_server": [
+    "db:migration:up:dev"
+  ],
+  "migrate_test": [
+    "db:migration:up:test"
+  ],
+  "seed": [
+    "db:seed:dev"
+  ],
+  "has_websocket": false
+}

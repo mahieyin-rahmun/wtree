@@ -1,0 +1,5 @@
+.state/
+__pycache__/
+node_modules/
+/projects/**/*.json
+!/projects/template.json
