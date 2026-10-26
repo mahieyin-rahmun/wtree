@@ -1,7 +1,7 @@
 name: shared-dev
 services:
   dev_postgres:
-    image: postgres:16
+    image: imresamu/postgis:16-3.6-trixie
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -15,7 +15,7 @@ services:
       timeout: 5s
       retries: 30
   test_postgres:
-    image: postgres:16
+    image: imresamu/postgis:16-3.6-trixie
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

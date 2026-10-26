@@ -63,10 +63,28 @@ Run project commands inside the checkout. From elsewhere, use `wtree --repo /pat
 | `wtree setup main` | Provision an existing checkout. |
 | `wtree dev` | Start the mapped apps. |
 | `wtree status` | Show URLs, ports, and databases. |
-| `wtree remove` | Delete the checkout after ID confirmation. Keep its branch and databases. |
+| `wtree remove` | Delete the checkout and all its branch setups after ID confirmation. Keep its branches and databases. |
+| `wtree cleanup` | Remove the current branch's setup: routes, ports, registry entry. Keep files. |
 | `wtree stripe` | Save the signing secret. Restart the API afterward. |
 
 Shared services: `base-local-infra up`, `status`, or `down`. Stopping them keeps volumes.
+
+## Branches
+
+Each branch in a checkout gets its own setup: ports, URLs, databases, and migration progress. After you check out a branch, run `wtree setup` once. Switching back to a branch reuses its setup. `dev`, `status`, and `stripe` use the setup of the current branch and fail when it has none. `dev` writes the current branch's values to the env files. Detached HEAD is not supported.
+
+To review a branch in the main checkout without a new worktree:
+
+```sh
+git switch development
+wtree setup
+wtree dev
+wtree cleanup --destroy-databases
+```
+
+New branch setups run all migrations and seeds. To skip seeds, set `"is_imported": true` in `.worktree/initialization/<id>.json` before setup.
+
+After an upgrade from an earlier wtree version, the existing setup goes to the first branch that runs a wtree command. Its ID and databases do not change.
 
 ## Options
 
@@ -78,9 +96,12 @@ Shared services: `base-local-infra up`, `status`, or `down`. Stopping them keeps
 | `create <name> --existing --branch <branch>` | Use an existing branch. |
 | `create` or `setup` with `--redis-namespace` | Separate Redis keys, channels, and queues by checkout and stage. |
 | `remove --force` | Discard uncommitted changes and untracked files. |
-| `remove --destroy-databases` | Also delete the checkout's dev/test databases. |
+| `remove --destroy-databases` | Also delete the dev/test databases of all the checkout's setups. |
+| `cleanup --destroy-databases` | Also delete the current branch's dev/test databases and migration progress. Without it, a later `setup` reuses them. |
 
 Stop servers and tests before removal. Ignored files and backups are deleted too. The main checkout is protected.
+
+With `--destroy-databases`, removal and cleanup check PostgreSQL access before deleting files or setup entries. If either database service is stopped, start it and retry. PostgreSQL errors include the service name and the command's error output.
 
 `wtree stripe` requires a server. Repo scripts own test preparation and any test worker databases. Existing `_1` databases from earlier wtree versions remain untouched, including by `remove --destroy-databases`; clean them up manually when no longer needed.
 
@@ -124,3 +145,7 @@ For custom monorepo folders:
 ```
 
 Keep only the apps that exist. App commands use their mapped folders; configured migration and seed scripts run at the repo root. Web-only setup skips app databases, storage, migrations, and seeds. External API, web, and WebSocket URLs stay in the env files when the corresponding app is absent. There are no command-line path overrides.
+
+## Checks
+
+Run `mise exec python@3.12 -- python -m unittest -v` for the registry and removal regression tests. These tests use temporary files and mock external commands.

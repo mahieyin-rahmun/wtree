@@ -23,6 +23,7 @@ PORTLESS = shutil.which("portless") or next(
     (str(path) for path in (Path.home() / ".local/share/mise/installs/node").glob("*/bin/portless")), None)
 APP_FOLDERS = {"server": "apps/server", "worker": "apps/worker",
                "web": "apps/web-app", "backend": "packages/backend"}
+REGISTRY_PATH = INFRA_ROOT / ".state/registry.json"
 
 
 def resolve_config(repo, config):
@@ -78,43 +79,80 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
     path.chmod(0o600)
 
+def current_branch(repo):
+    branch = run(["git", "branch", "--show-current"], cwd=repo, has_capture=True).stdout.strip()
+    if not branch:
+        raise RuntimeError("Check out a branch first. wtree setups are per branch.")
+    return branch
 
-def register(repo, config, name=None, has_redis_namespace=None):
-    directory = INFRA_ROOT / ".state"
-    directory.mkdir(exist_ok=True)
-    with (directory / "registry.lock").open("a") as lock:
+
+def entry_key(repo, branch):
+    return f"{repo}#{branch}"
+
+
+def repo_entries(entries, repo):
+    return [(key, entry) for key, entry in entries.items() if entry["repo"] == str(repo)]
+
+
+def progress_path(repo, entry):
+    return repo / ".worktree/initialization" / f"{entry['id']}.json"
+
+
+def to_label(name):
+    return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40].rstrip("-") or "worktree"
+
+
+def register(repo, config, name=None, has_redis_namespace=None, should_create=False):
+    branch = current_branch(repo)
+    key = entry_key(repo, branch)
+    REGISTRY_PATH.parent.mkdir(exist_ok=True)
+    with REGISTRY_PATH.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        path = directory / "registry.json"
-        state = load_json(path, {"worktrees": {}})
+        state = load_json(REGISTRY_PATH, {"worktrees": {}})
         entries = state["worktrees"]
-        if str(repo) not in entries:
+        legacy = entries.get(str(repo))
+        if key not in entries and legacy and "branch" not in legacy:
+            legacy["branch"] = branch
+            entries[key] = entries.pop(str(repo))
+            legacy_progress = repo / ".worktree/initialization.json"
+            if legacy_progress.exists() and not progress_path(repo, legacy).exists():
+                progress_path(repo, legacy).parent.mkdir(parents=True, exist_ok=True)
+                legacy_progress.rename(progress_path(repo, legacy))
+        if key not in entries:
+            if not should_create:
+                raise RuntimeError(f"No setup for branch {branch}. Run: wtree setup")
             used_slots = {entry["slot"] for entry in entries.values()}
             slot = 0
             while slot in used_slots or not can_use_ports(12000 + 100 * slot):
                 slot += 1
                 if slot > 350:
                     raise RuntimeError("No available worktree port blocks")
-            branch = run(["git", "branch", "--show-current"], cwd=repo, has_capture=True).stdout.strip()
-            label = re.sub(r"[^a-z0-9-]+", "-", (name or branch).lower()).strip("-")[:40].rstrip("-") or "worktree"
-            worktree_id = hashlib.sha256(str(repo).encode()).hexdigest()[:8]
+            label = to_label(name or branch)
+            worktree_id = hashlib.sha256(f"{repo}\0{branch}".encode()).hexdigest()[:8]
             if any(entry["project"] == config["project"] and entry["label"] == label for entry in entries.values()):
                 label += "-" + worktree_id
             base = 12000 + 100 * slot
-            entries[str(repo)] = {"repo": str(repo), "project": config["project"], "prefix": config["prefix"],
-                                  "id": worktree_id, "label": label, "slot": slot, "is_ready": False,
-                                  "ports": {"web": base, "api": base + 1, "ws": base + 2,
-                                            "test_api": base + 9, "test_ws": base + 10}}
-        entry = entries[str(repo)]
+            entries[key] = {"repo": str(repo), "branch": branch, "project": config["project"],
+                            "prefix": config["prefix"], "id": worktree_id, "label": label, "slot": slot,
+                            "is_ready": False,
+                            "ports": {"web": base, "api": base + 1, "ws": base + 2,
+                                      "test_api": base + 9, "test_ws": base + 10}}
+        entry = entries[key]
+        for other_key, other in list(entries.items()):
+            if (other_key != key and other["repo"] == str(repo)
+                    and other.get("branch") == branch and other["id"] == entry["id"]):
+                entry["is_ready"] = entry.get("is_ready", False) or other.get("is_ready", False)
+                entries.pop(other_key)
         if name:
-            label = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40].rstrip("-") or "worktree"
+            label = to_label(name)
             if any(other["project"] == config["project"] and other["label"] == label
-                   and other["repo"] != str(repo) for other in entries.values()):
+                   and other_key != key for other_key, other in entries.items()):
                 label += "-" + entry["id"]
             entry["label"] = label
         if has_redis_namespace is not None:
             entry["has_redis_namespace"] = has_redis_namespace
-        save_json(path, state)
-        return entries[str(repo)]
+        save_json(REGISTRY_PATH, state)
+        return key, entry
 
 
 def can_use_ports(base):
@@ -280,8 +318,12 @@ def child_environment(repo, entry, config, role):
 
 def query(is_test, sql, database="postgres", *, cwd=None):
     service = "test_postgres" if is_test else "dev_postgres"
-    return run([*COMPOSE, "exec", "-T", service, "psql", "-U", "postgres", "-d", database,
-                "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1"], cwd=cwd, input_text=sql, has_capture=True).stdout.strip()
+    try:
+        return run([*COMPOSE, "exec", "-T", service, "psql", "-U", "postgres", "-d", database,
+                    "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1"], cwd=cwd, input_text=sql, has_capture=True).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or str(error)).strip()
+        raise RuntimeError(f"PostgreSQL service {service}: {detail}") from error
 
 
 def ensure_database(name, is_test):
@@ -314,19 +356,24 @@ def storage(config):
     aws("s3api", "put-bucket-cors", "--bucket", bucket, "--cors-configuration", json.dumps(cors))
 
 
-def setup(repo, entry, config, source=None, source_config=None):
+def env_roles(config):
+    return [role for role in ("server", "test", "worker", "web") if role in config["mapping"]]
+
+
+def env_sources(repo, config, source=None, source_config=None):
     source_config = source_config or config
-    roles = [role for role in ("server", "test", "worker", "web") if role in config["mapping"]]
     sources = {}
-    for role in roles:
+    for role in env_roles(config):
         if not env_file(repo, config, role).exists():
             if source and role in source_config["mapping"]:
                 sources[role] = discover_env_file(source, source_config, role)
             else:
                 sources[role] = discover_env_file(repo, config, role)
-    proxy(entry, config)
-    run([*COMPOSE, "up", "-d", "--wait"])
-    for role in roles:
+    return sources
+
+
+def write_env_files(repo, entry, config, sources):
+    for role in env_roles(config):
         path = env_file(repo, config, role)
         if not path.exists():
             shutil.copyfile(sources[role], path)
@@ -344,35 +391,41 @@ def setup(repo, entry, config, source=None, source_config=None):
                 values["REDIS_QUEUE_PREFIX"] = original
         removed = () if entry.get("has_redis_namespace") else ("REDIS_NAMESPACE",)
         update_env(path, values, removed)
+
+
+def setup(repo, key, entry, config, source=None, source_config=None):
+    sources = env_sources(repo, config, source, source_config)
+    proxy(entry, config)
+    run([*COMPOSE, "up", "-d", "--wait"])
+    write_env_files(repo, entry, config, sources)
     for is_test in (False, True):
         for name in database_names(entry, config, is_test).values():
             ensure_database(name, is_test)
     primary = backend_role(config)
     if primary:
         storage(config)
-    path = repo / ".worktree/initialization.json"
+    path = progress_path(repo, entry)
     progress = load_json(path, {})
     commands = [(role, command, f"{stage}:{command}") for stage, role in (("server", primary), ("test", "test"))
                 for command in config[f"migrate_{stage}"]] if primary else []
     if primary and not progress.get("is_imported"):
         commands += [(primary, command, f"seed:{command}") for command in config["seed"]]
-    for role, command, key in commands:
-        if not progress.get(key):
+    for role, command, progress_key in commands:
+        if not progress.get(progress_key):
             run(["pnpm", "run", command], cwd=repo, env=child_environment(repo, entry, config, role))
-            progress[key] = True
+            progress[progress_key] = True
             save_json(path, progress)
     entry["is_ready"] = True
-    registry_path = INFRA_ROOT / ".state/registry.json"
-    with registry_path.with_suffix(".lock").open("a") as lock:
+    with REGISTRY_PATH.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = load_json(registry_path, {})
-        state["worktrees"][str(repo)] = entry
-        save_json(registry_path, state)
+        state = load_json(REGISTRY_PATH, {})
+        state["worktrees"][key] = entry
+        save_json(REGISTRY_PATH, state)
     status(entry, config)
 
 
 def status(entry, config):
-    print(f"{entry['project']}/{entry['label']} ({entry['id']})")
+    print(f"{entry['project']}/{entry['label']} ({entry['id']}) on {entry['branch']}")
     for host, port in routes(entry, config).items():
         print(f"  {public_origin(host)} -> localhost:{port}")
     for is_test in (False, True):
@@ -381,40 +434,76 @@ def status(entry, config):
             print(f"  {'Test' if is_test else 'Dev'}: " + ", ".join(names.values()))
 
 
-def remove(repo, entry, config, should_destroy, should_force=False):
+def setup_databases(setups, config):
+    return list(dict.fromkeys((name, is_test) for _, entry in setups for is_test in (False, True)
+                             for name in database_names(entry, config, is_test).values()))
+
+
+def check_databases(setups, config):
+    for is_test in dict.fromkeys(is_test for _, is_test in setup_databases(setups, config)):
+        query(is_test, "SELECT 1;", cwd=INFRA_ROOT)
+
+
+def unregister(setups, config, should_destroy):
+    for host in dict.fromkeys(host for _, entry in setups for host in routes(entry, config)):
+        run([PORTLESS, "alias", "--remove", host.removesuffix(".localhost")], cwd=INFRA_ROOT, can_fail=True)
+    with REGISTRY_PATH.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_json(REGISTRY_PATH, {"worktrees": {}})
+        for key, _ in setups:
+            state["worktrees"].pop(key, None)
+        save_json(REGISTRY_PATH, state)
+    if should_destroy:
+        for name, is_test in setup_databases(setups, config):
+            query(is_test, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE);', cwd=INFRA_ROOT)
+
+
+def remove(repo, setups, config, should_destroy, should_force=False):
     git_directory = Path(run(["git", "rev-parse", "--absolute-git-dir"],
                              cwd=repo, has_capture=True).stdout.strip()).resolve()
     common_directory = Path(run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                 cwd=repo, has_capture=True).stdout.strip()).resolve()
     if git_directory == common_directory:
         raise RuntimeError("Cannot remove the main checkout. Run remove from a linked worktree.")
-    names = []
+    branch = run(["git", "branch", "--show-current"], cwd=repo, has_capture=True).stdout.strip()
+    confirmation = next((entry["id"] for _, entry in setups if entry.get("branch") == branch), setups[0][1]["id"])
     print(f"Worktree to delete: {repo}\nAll files in this checkout, including ignored files, will be deleted.")
     if should_force:
         print("Uncommitted changes and untracked files will also be deleted.")
+    print("Setups to remove:\n" + "\n".join(
+        dict.fromkeys(f"{entry['label']} ({entry['id']}) on {entry.get('branch', 'unknown branch')}"
+                      for _, entry in setups)))
     if should_destroy:
-        names = [(name, is_test) for is_test in (False, True)
-                 for name in database_names(entry, config, is_test).values()]
-        print("Databases to delete:\n" + "\n".join(name for name, _ in names))
-    if input(f"Type {entry['id']} to confirm removal: ") != entry["id"]:
+        print("Databases to delete:\n" + "\n".join(name for name, _ in setup_databases(setups, config)))
+    if input(f"Type {confirmation} to confirm removal: ") != confirmation:
         print("Removal cancelled.")
         return
+    if should_destroy:
+        check_databases(setups, config)
     command = ["git", "worktree", "remove"]
     if should_force:
         command.append("--force")
     command.append(str(repo))
     run(command, cwd=common_directory)
-    for host in routes(entry, config):
-        run([PORTLESS, "alias", "--remove", host.removesuffix(".localhost")], cwd=INFRA_ROOT, can_fail=True)
-    registry_path = INFRA_ROOT / ".state/registry.json"
-    with registry_path.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        state = load_json(registry_path, {"worktrees": {}})
-        state["worktrees"].pop(str(repo), None)
-        save_json(registry_path, state)
-    for name, is_test in names:
-        query(is_test, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE);', cwd=INFRA_ROOT)
-    print("Worktree, files, routes, and registry entry removed. Databases "
+    unregister(setups, config, should_destroy)
+    print("Worktree, files, routes, and registry entries removed. Databases "
+          + ("deleted." if should_destroy else "preserved."))
+
+
+def cleanup(repo, key, entry, config, should_destroy):
+    print(f"Setup to remove: {entry['label']} ({entry['id']}) on {entry['branch']}\nFiles are kept.")
+    print("Routes to remove:\n" + "\n".join(public_origin(host) for host in routes(entry, config)))
+    if should_destroy:
+        print("Databases to delete:\n" + "\n".join(name for name, _ in setup_databases([(key, entry)], config)))
+    if input(f"Type {entry['id']} to confirm cleanup: ") != entry["id"]:
+        print("Cleanup cancelled.")
+        return
+    if should_destroy:
+        check_databases([(key, entry)], config)
+    unregister([(key, entry)], config, should_destroy)
+    if should_destroy:
+        progress_path(repo, entry).unlink(missing_ok=True)
+    print("Routes, ports, and registry entry removed. Databases "
           + ("deleted." if should_destroy else "preserved."))
 
 
@@ -441,6 +530,7 @@ def stripe(repo, entry, config):
 
 
 def dev(repo, entry, config):
+    write_env_files(repo, entry, config, env_sources(repo, config))
     proxy(entry, config)
     status(entry, config)
     commands = [(role, app_command(repo, config, role, "run", "start:dev"))
@@ -480,9 +570,11 @@ def main():
     provision.add_argument("--redis-namespace", action="store_true")
     for name in ("status", "dev", "stripe"):
         commands.add_parser(name)
-    cleanup = commands.add_parser("remove")
-    cleanup.add_argument("--destroy-databases", action="store_true")
-    cleanup.add_argument("--force", action="store_true", help="Discard uncommitted changes and untracked files")
+    removal = commands.add_parser("remove")
+    removal.add_argument("--destroy-databases", action="store_true")
+    removal.add_argument("--force", action="store_true", help="Discard uncommitted changes and untracked files")
+    branch_cleanup = commands.add_parser("cleanup", help="Remove the current branch's setup and keep the files")
+    branch_cleanup.add_argument("--destroy-databases", action="store_true")
     args = parser.parse_args()
     if args.command == "infra":
         if args.action == "up":
@@ -514,22 +606,24 @@ def main():
         run(command, cwd=repo)
         destination_config = resolve_config(destination, project_config)
         run(["pnpm", "install", "--frozen-lockfile"], cwd=destination)
-        setup(destination, register(destination, destination_config, args.name, args.redis_namespace),
-              destination_config, repo, config)
+        key, entry = register(destination, destination_config, args.name, args.redis_namespace, should_create=True)
+        setup(destination, key, entry, destination_config, repo, config)
         print(f"\ncd {destination}\nRun the same Python alias with 'dev' to start it.")
         return
     if args.command == "setup":
-        entry = register(repo, config, args.name, args.redis_namespace)
-        setup(repo, entry, config)
+        key, entry = register(repo, config, args.name, args.redis_namespace, should_create=True)
+        setup(repo, key, entry, config)
         return
     if args.command == "remove":
-        entry = load_json(INFRA_ROOT / ".state/registry.json", {"worktrees": {}})["worktrees"].get(str(repo))
-        if not entry:
+        setups = repo_entries(load_json(REGISTRY_PATH, {"worktrees": {}})["worktrees"], repo)
+        if not setups:
             raise RuntimeError(f"Checkout is not registered: {repo}")
-        remove(repo, entry, config, args.destroy_databases, args.force)
+        remove(repo, setups, config, args.destroy_databases, args.force)
         return
-    entry = register(repo, config)
-    if args.command == "status":
+    key, entry = register(repo, config)
+    if args.command == "cleanup":
+        cleanup(repo, key, entry, config, args.destroy_databases)
+    elif args.command == "status":
         status(entry, config)
     elif args.command == "dev":
         return dev(repo, entry, config)
