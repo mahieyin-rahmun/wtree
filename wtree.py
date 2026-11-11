@@ -102,7 +102,7 @@ def to_label(name):
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40].rstrip("-") or "worktree"
 
 
-def register(repo, config, name=None, has_redis_namespace=None, should_create=False):
+def register(repo, config, name=None, should_create=False):
     branch = current_branch(repo)
     key = entry_key(repo, branch)
     REGISTRY_PATH.parent.mkdir(exist_ok=True)
@@ -149,8 +149,7 @@ def register(repo, config, name=None, has_redis_namespace=None, should_create=Fa
                    and other_key != key for other_key, other in entries.items()):
                 label += "-" + entry["id"]
             entry["label"] = label
-        if has_redis_namespace is not None:
-            entry["has_redis_namespace"] = has_redis_namespace
+        entry.pop("has_redis_namespace", None)
         save_json(REGISTRY_PATH, state)
         return key, entry
 
@@ -209,14 +208,12 @@ def read_env(path: Path) -> dict[str, str]:
     return values
 
 
-def update_env(path, values, removed=()):
+def update_env(path, values):
     lines = path.read_text().splitlines() if path.exists() else []
     remaining = dict(values)
     result = []
     for line in lines:
         key = line.removeprefix("export ").split("=", 1)[0].strip()
-        if key in removed:
-            continue
         if key in values:
             if key in remaining:
                 result.append(f"{key}='{remaining.pop(key)}'")
@@ -275,8 +272,7 @@ def build_environment(entry: dict, config: dict, role: str) -> dict[str, str]:
             values.pop(key)
     if "web" not in config["mapping"]:
         values.pop("WEB_CLIENT_BASE_URL")
-    if entry.get("has_redis_namespace"):
-        values.update(REDIS_NAMESPACE=namespace, REDIS_QUEUE_PREFIX=namespace)
+    values.update(REDIS_NAMESPACE=namespace, REDIS_QUEUE_PREFIX=namespace)
     port = TEST_DATABASE_PORT if is_test else DEV_DATABASE_PORT
     for key, name in database_names(entry, config, is_test).items():
         values[key] = f"postgresql://{DATABASE_USER}:{DATABASE_PASSWORD}@127.0.0.1:{port}/{name}?schema=public"
@@ -310,10 +306,7 @@ def managed_environment(entry, config, role):
 
 
 def child_environment(repo, entry, config, role):
-    values = {**os.environ, **read_env(discover_env_file(repo, config, role)), **managed_environment(entry, config, role)}
-    if not entry.get("has_redis_namespace"):
-        values.pop("REDIS_NAMESPACE", None)
-    return values
+    return {**os.environ, **read_env(discover_env_file(repo, config, role)), **managed_environment(entry, config, role)}
 
 
 def query(is_test, sql, database="postgres", *, cwd=None):
@@ -382,15 +375,7 @@ def write_env_files(repo, entry, config, sources):
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, backup)
             backup.chmod(0o600)
-        values = managed_environment(entry, config, role)
-        if not entry.get("has_redis_namespace") and role != "web":
-            original = read_env(backup).get("REDIS_QUEUE_PREFIX", read_env(path.parent / ".env.example").get("REDIS_QUEUE_PREFIX"))
-            if original and re.fullmatch(r"[a-z-]+:[a-f0-9]+:(dev|test)", original):
-                original = read_env(path.parent / ".env.example").get("REDIS_QUEUE_PREFIX")
-            if original:
-                values["REDIS_QUEUE_PREFIX"] = original
-        removed = () if entry.get("has_redis_namespace") else ("REDIS_NAMESPACE",)
-        update_env(path, values, removed)
+        update_env(path, managed_environment(entry, config, role))
 
 
 def setup(repo, key, entry, config, source=None, source_config=None):
@@ -564,10 +549,8 @@ def main():
     create.add_argument("--branch", help="Defaults to the worktree name")
     create.add_argument("--base", default="HEAD")
     create.add_argument("--existing", action="store_true")
-    create.add_argument("--redis-namespace", action="store_true")
     provision = commands.add_parser("setup")
     provision.add_argument("name", nargs="?")
-    provision.add_argument("--redis-namespace", action="store_true")
     for name in ("status", "dev", "stripe"):
         commands.add_parser(name)
     removal = commands.add_parser("remove")
@@ -606,12 +589,12 @@ def main():
         run(command, cwd=repo)
         destination_config = resolve_config(destination, project_config)
         run(["pnpm", "install", "--frozen-lockfile"], cwd=destination)
-        key, entry = register(destination, destination_config, args.name, args.redis_namespace, should_create=True)
+        key, entry = register(destination, destination_config, args.name, should_create=True)
         setup(destination, key, entry, destination_config, repo, config)
         print(f"\ncd {destination}\nRun the same Python alias with 'dev' to start it.")
         return
     if args.command == "setup":
-        key, entry = register(repo, config, args.name, args.redis_namespace, should_create=True)
+        key, entry = register(repo, config, args.name, should_create=True)
         setup(repo, key, entry, config)
         return
     if args.command == "remove":

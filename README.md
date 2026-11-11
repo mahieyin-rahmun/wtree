@@ -10,6 +10,7 @@ Default detection and `dev` follow NestJS backend and Next.js frontend conventio
 - Detects the default folder layout described below. Set `mapping` in the project config for custom paths.
 - `dev` uses backend `start:dev` scripts, the shared backend's `build` script when present, and the Next.js CLI. Migration/seed scripts run at the repo root and handle their own build prerequisites.
 - Runs apps on the host with shared PostgreSQL, Redis, LocalStack, and Mailpit services from `compose.yaml`.
+- Sets `REDIS_NAMESPACE` and `REDIS_QUEUE_PREFIX` to `<project>:<id>:<dev|test>` so each checkout and stage has its own Redis keys, channels, and queues.
 - Copies env files and overrides managed connection values. App settings such as `EMAIL_PROVIDER` are preserved; your apps must support the generated env keys.
 
 ## Getting Started
@@ -94,7 +95,6 @@ After an upgrade from an earlier wtree version, the existing setup goes to the f
 | --- | --- |
 | `create <name> [path] --branch <branch> --base <ref>` | Defaults: sibling path, branch `<name>`, base `HEAD`. |
 | `create <name> --existing --branch <branch>` | Use an existing branch. |
-| `create` or `setup` with `--redis-namespace` | Separate Redis keys, channels, and queues by checkout and stage. |
 | `remove --force` | Discard uncommitted changes and untracked files. |
 | `remove --destroy-databases` | Also delete the dev/test databases of all the checkout's setups. |
 | `cleanup --destroy-databases` | Also delete the current branch's dev/test databases and migration progress. Without it, a later `setup` reuses them. |
